@@ -5,5 +5,9 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"idf.projectDir": "${workspaceFolder}/SHS-Z2M-Presence",
+		"cmake.sourceDirectory": "${workspaceFolder}/SHS-Z2M-Presence",
+		"cmake.buildDirectory": "${workspaceFolder}/SHS-Z2M-Presence/build"
+	}
 }

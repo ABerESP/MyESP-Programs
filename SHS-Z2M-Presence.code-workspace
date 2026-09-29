@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"name": "SHS-Z2M-Presence",
+			"path": "SHS-Z2M-Presence"
+		}
+	],
+	"settings": {
+		"idf.currentSetup": "C:\\esp\\v6.1\\esp-idf"
+	}
+}
