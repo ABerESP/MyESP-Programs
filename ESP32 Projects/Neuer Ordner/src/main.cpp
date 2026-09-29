@@ -5,7 +5,7 @@
 #include <Wire.h>
 #include <time.h>
 
-#include <Adafruit_AHTX0.h>
+#include <Adafruit_HDC1000.h>
 #include <DFRobot_ENS160.h>
 #include <GxEPD2_BW.h>
 #include <U8g2_for_Adafruit_GFX.h>
@@ -13,7 +13,7 @@
 #include "config.h"
 
 DFRobot_ENS160_I2C ens160(&Wire, SENSOR_I2C_ADDRESS);
-Adafruit_AHTX0 aht20;
+Adafruit_HDC1000 hdc1008;
 GxEPD2_BW<GxEPD2_270, GxEPD2_270::HEIGHT> display(
   GxEPD2_270(EPD_CS_PIN, EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN));
 U8G2_FOR_ADAFRUIT_GFX textRenderer;
@@ -35,7 +35,7 @@ struct SensorReading {
 };
 
 bool ens160Ready = false;
-bool aht20Ready = false;
+bool hdc1008Ready = false;
 int lastRenderedMinute = -1;
 uint32_t lastRefreshMillis = 0;
 uint8_t minutesSinceFullRefresh = 0;
@@ -45,14 +45,19 @@ bool aqiAlertVisible = true;
 uint32_t lastAqiBlinkMillis = 0;
 
 const uint32_t AQI_BLINK_INTERVAL_MS = 500;
+const uint32_t GAS_VALUE_UPDATE_INTERVAL_MS = 5000;
 const int16_t AQI_BAR_FIRST_BOX_X = 148;
 const int16_t AQI_BAR_Y = 89;
 const int16_t AQI_BOX_WIDTH = 17;
 const int16_t AQI_BOX_HEIGHT = 11;
 const int16_t AQI_BOX_GAP = 4;
+uint32_t lastGasValueUpdateMillis = 0;
+uint16_t cachedTvoc = 0;
+uint16_t cachedEco2 = 0;
+bool gasValuesInitialized = false;
 
 uint8_t simulatedAqiTestValue() {
-  return static_cast<uint8_t>((millis() / 1000UL) % 5 + 1);
+  return static_cast<uint8_t>((millis() / 10000UL) % 5 + 1);
 }
 
 const char* aqiLabel(uint8_t aqi) {
@@ -125,19 +130,21 @@ bool initializeENS160() {
   return true;
 }
 
-bool initializeAHT20() {
-  if (!aht20.begin(&Wire)) {
-    Serial.println("AHT20 not found; will retry on the next refresh.");
+bool initializeHDC1008() {
+  if (!hdc1008.begin(HDC1008_I2C_ADDRESS, &Wire)) {
+    Serial.println("HDC1008 not found; will retry on the next refresh.");
     return false;
   }
 
-  Serial.println("AHT20 ready.");
+  Serial.println("HDC1008 ready.");
   return true;
 }
 
 SensorReading readSensors() {
 #if SIMULATE_SENSOR_DATA
-  const float phase = millis() / 1000.0f;
+  const float phase = millis() / 10000.0f;
+  const float gasPhase =
+      static_cast<float>(millis() / GAS_VALUE_UPDATE_INTERVAL_MS);
 #if SIMULATE_AQI_TEST
   const uint8_t aqi = simulatedAqiTestValue();
 #else
@@ -148,27 +155,25 @@ SensorReading readSensors() {
       true,
       0,
       aqi,
-      static_cast<uint16_t>(180.0f + 90.0f * (1.0f + sinf(phase / 4.0f))),
-      static_cast<uint16_t>(430.0f + 140.0f * (1.0f + sinf(phase / 6.0f))),
+      static_cast<uint16_t>(180.0f + 90.0f * (1.0f + sinf(gasPhase / 4.0f))),
+      static_cast<uint16_t>(430.0f + 140.0f * (1.0f + sinf(gasPhase / 6.0f))),
       22.0f + 1.5f * sinf(phase / 8.0f),
       45.0f + 8.0f * sinf(phase / 10.0f)};
   return reading;
 #else
   SensorReading reading = {false, false, 3, 0, 0, 0, 0.0f, 0.0f};
 
-  if (!aht20Ready) {
-    aht20Ready = initializeAHT20();
+  if (!hdc1008Ready) {
+    hdc1008Ready = initializeHDC1008();
   }
 
-  if (aht20Ready) {
-    sensors_event_t humidityEvent;
-    sensors_event_t temperatureEvent;
-    aht20.getEvent(&humidityEvent, &temperatureEvent);
-    if (isfinite(temperatureEvent.temperature) &&
-        isfinite(humidityEvent.relative_humidity)) {
+  if (hdc1008Ready) {
+    const float temperature = hdc1008.readTemperature();
+    const float humidity = hdc1008.readHumidity();
+    if (isfinite(temperature) && isfinite(humidity)) {
       reading.climateAvailable = true;
-      reading.temperature = temperatureEvent.temperature;
-      reading.humidity = humidityEvent.relative_humidity;
+      reading.temperature = temperature;
+      reading.humidity = humidity;
     }
   }
 
@@ -192,8 +197,15 @@ SensorReading readSensors() {
   reading.ens160Available = true;
   reading.status = ens160.getENS160Status();
   reading.aqi = ens160.getAQI();
-  reading.tvoc = ens160.getTVOC();
-  reading.eco2 = ens160.getECO2();
+  if (!gasValuesInitialized ||
+      millis() - lastGasValueUpdateMillis >= GAS_VALUE_UPDATE_INTERVAL_MS) {
+    cachedTvoc = ens160.getTVOC();
+    cachedEco2 = ens160.getECO2();
+    lastGasValueUpdateMillis = millis();
+    gasValuesInitialized = true;
+  }
+  reading.tvoc = cachedTvoc;
+  reading.eco2 = cachedEco2;
 #if SIMULATE_AQI_TEST
   reading.status = 0;
   reading.aqi = simulatedAqiTestValue();
@@ -272,10 +284,10 @@ void drawDashboard(const SensorReading& reading, const struct tm* currentTime,
     display.fillScreen(GxEPD_WHITE);
     display.fillRect(0, 0, display.width(), 29, GxEPD_BLACK);
 
-    drawText(dateText, 6, 24, FONT_LARGE, GxEPD_WHITE);
-    textRenderer.setFont(FONT_LARGE);
+    drawText(dateText, 6, 22, FONT_RATING, GxEPD_WHITE);
+    textRenderer.setFont(FONT_RATING);
     const int16_t timeWidth = textRenderer.getUTF8Width(timeText);
-    drawText(timeText, display.width() - 7 - timeWidth, 24, FONT_LARGE,
+    drawText(timeText, display.width() - 7 - timeWidth, 22, FONT_RATING,
              GxEPD_WHITE);
 
     drawCenteredText("Temperatur", 66, 43, FONT_SMALL, GxEPD_BLACK);
@@ -377,7 +389,7 @@ void setup() {
 #if SIMULATE_SENSOR_DATA
   Serial.println("Sensor simulation enabled.");
 #else
-  aht20Ready = initializeAHT20();
+  hdc1008Ready = initializeHDC1008();
   ens160Ready = initializeENS160();
 #endif
 
