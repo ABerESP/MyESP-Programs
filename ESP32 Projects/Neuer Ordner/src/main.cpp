@@ -20,7 +20,7 @@
 DFRobot_ENS160_I2C ens160(&Wire, SENSOR_I2C_ADDRESS);
 Adafruit_HDC1000 hdc1008;
 Adafruit_NeoPixel aqiPixels(WS2812_LED_COUNT, WS2812_DATA_PIN,
-                            NEO_GRB + NEO_KHZ800);
+                            NEO_RGB + NEO_KHZ800);
 GxEPD2_BW<GxEPD2_270, GxEPD2_270::HEIGHT> display(
   GxEPD2_270(EPD_CS_PIN, EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN));
 WebServer webServer(80);
@@ -52,7 +52,7 @@ uint8_t displayedAqi = 0;
 bool displayedAqiAvailable = false;
 bool aqiAlertVisible = true;
 uint32_t lastAqiBlinkMillis = 0;
-uint32_t dashboardRefreshIntervalMs = 1000;
+uint32_t dashboardRefreshIntervalMs = 5000;
 uint8_t aqiLedBrightness = WS2812_BRIGHTNESS;
 String configuredWifiSsid;
 String configuredWifiPassword;
@@ -67,6 +67,7 @@ String mqttBaseTopic;
 uint16_t mqttPort = MQTT_DEFAULT_PORT;
 float fallbackTemperatureC = ENS160_FALLBACK_TEMPERATURE_C;
 float fallbackHumidityPercent = ENS160_FALLBACK_HUMIDITY_PERCENT;
+float temperatureOffsetC = 0.0f;   // Kompensation, wird zur Messung addiert
 uint32_t lastMqttConnectAttemptMillis = 0;
 bool simulateSensorData = SIMULATE_SENSOR_DATA != 0;
 bool simulateAqiTest = SIMULATE_AQI_TEST != 0;
@@ -77,9 +78,13 @@ uint8_t simulatedAqi = 3;
 uint16_t simulatedTvoc = 120;
 uint16_t simulatedEco2 = 540;
 SensorReading latestReading = {};
-
+SensorReading displayedReading = {};   // was zuletzt auf dem E-Paper steht
+struct tm displayedTime = {};
+bool displayedTimeValid = false;
+const uint32_t LED_UPDATE_INTERVAL_MS = 500;
+uint32_t lastLedUpdateMillis = 0;
 const uint32_t AQI_BLINK_INTERVAL_MS = 500;
-const uint32_t GAS_VALUE_UPDATE_INTERVAL_MS = 5000;
+const uint32_t GAS_VALUE_UPDATE_INTERVAL_MS = 1000;
 const int16_t AQI_BAR_FIRST_BOX_X = 148;
 const int16_t AQI_BAR_Y = 89;
 const int16_t AQI_BOX_WIDTH = 17;
@@ -89,6 +94,75 @@ uint32_t lastGasValueUpdateMillis = 0;
 uint16_t cachedTvoc = 0;
 uint16_t cachedEco2 = 0;
 bool gasValuesInitialized = false;
+
+const uint8_t MEDIAN_MAX_WINDOW = 15;
+bool displayPortrait = false;          // true = Hochformat (90 Grad gedreht)
+bool displayLayoutChanged = false;
+bool sensorRestartPending = false;
+const int16_t P_AQI_BAR_FIRST_BOX_X = 10;
+const int16_t P_AQI_BAR_Y = 152;
+const int16_t P_AQI_BOX_WIDTH = 28;
+const int16_t P_AQI_BOX_HEIGHT = 12;
+const int16_t P_AQI_BOX_GAP = 4;
+
+uint8_t displayRotation() {
+  return displayPortrait ? 0 : 1;
+}
+
+struct MedianFilter {
+  uint16_t samples[MEDIAN_MAX_WINDOW];
+  uint8_t count;
+  uint8_t next;
+};
+
+MedianFilter tvocMedian = {};
+MedianFilter eco2Median = {};
+uint8_t tvocMedianWindow = 10;   // 1 = Filter aus
+uint8_t eco2MedianWindow = 10;   // 1 = Filter aus
+
+void resetMedian(MedianFilter& filter) {
+  filter.count = 0;
+  filter.next = 0;
+}
+
+uint16_t medianPush(MedianFilter& filter, uint16_t value, uint8_t window) {
+  window = constrain(window, 1, MEDIAN_MAX_WINDOW);
+  if (window == 1) {
+    resetMedian(filter);
+    return value;
+  }
+  if (filter.next >= window) filter.next = 0;
+  filter.samples[filter.next] = value;
+  filter.next = (filter.next + 1) % window;
+  if (filter.count < window) ++filter.count;
+
+  uint16_t sorted[MEDIAN_MAX_WINDOW];
+  memcpy(sorted, filter.samples, filter.count * sizeof(uint16_t));
+  for (uint8_t i = 1; i < filter.count; ++i) {        // Insertion Sort
+    const uint16_t key = sorted[i];
+    int8_t j = i - 1;
+    while (j >= 0 && sorted[j] > key) {
+      sorted[j + 1] = sorted[j];
+      --j;
+    }
+    sorted[j + 1] = key;
+  }
+  if (filter.count % 2 == 1) return sorted[filter.count / 2];
+  return static_cast<uint16_t>(
+      (uint32_t(sorted[filter.count / 2 - 1]) + sorted[filter.count / 2]) / 2);
+}
+
+bool gasSampleDue() {
+  return !gasValuesInitialized ||
+         millis() - lastGasValueUpdateMillis >= GAS_VALUE_UPDATE_INTERVAL_MS;
+}
+
+void storeGasSample(uint16_t rawTvoc, uint16_t rawEco2) {
+  cachedTvoc = medianPush(tvocMedian, rawTvoc, tvocMedianWindow);
+  cachedEco2 = medianPush(eco2Median, rawEco2, eco2MedianWindow);
+  lastGasValueUpdateMillis = millis();
+  gasValuesInitialized = true;
+}
 
 uint8_t simulatedAqiTestValue() {
   return static_cast<uint8_t>((millis() / 10000UL) % 5 + 1);
@@ -105,17 +179,27 @@ const char* aqiLabel(uint8_t aqi) {
   }
 }
 
+const uint16_t ECO2_GREEN_PPM = 600;    // eCO2: Grün bis hier
+const uint16_t ECO2_RED_PPM   = 1200;   // eCO2: Rot ab hier (Gelb bei 1000)
+const uint16_t TVOC_GREEN_PPB = 100;    // TVOC: Grün bis hier
+const uint16_t TVOC_RED_PPB   = 660;    // TVOC: Rot ab hier (Gelb bei ~380)
+
+float levelFromRange(uint16_t value, uint16_t green, uint16_t red) {
+  const uint16_t v = constrain(value, green, red);
+  return float(v - green) / float(red - green);   // 0 = grün, 1 = rot
+}
+
 void updateAqiPixels(const SensorReading& reading) {
   uint32_t color = 0;
   if (reading.ens160Available) {
-    switch (reading.aqi) {
-      case 1: color = aqiPixels.Color(0, 255, 0); break;
-      case 2: color = aqiPixels.Color(128, 255, 0); break;
-      case 3: color = aqiPixels.Color(255, 255, 0); break;
-      case 4: color = aqiPixels.Color(255, 96, 0); break;
-      case 5: color = aqiPixels.Color(255, 0, 0); break;
-      default: break;
-    }
+    const float eco2Level = levelFromRange(reading.eco2, ECO2_GREEN_PPM, ECO2_RED_PPM);
+    const float tvocLevel = levelFromRange(reading.tvoc, TVOC_GREEN_PPB, TVOC_RED_PPB);
+    const float t = max(eco2Level, tvocLevel);     // schlechterer Wert gewinnt
+
+    uint8_t r, g;
+    if (t < 0.5f) { r = uint8_t(255 * t * 2.0f); g = 255; }
+    else          { r = 255; g = uint8_t(255 * (1.0f - (t - 0.5f) * 2.0f)); }
+    color = aqiPixels.Color(r, g, 0);
   }
 
   aqiPixels.fill(color);
@@ -150,6 +234,27 @@ void drawCenteredValueWithUnit(const char* value, const char* unit,
 }
 
 void drawAqiAlertBoxes(uint8_t aqi, bool aqiAvailable, bool alertVisible) {
+  if (displayPortrait) {
+    display.setPartialWindow(104, 150, 64, 16);
+    display.firstPage();
+    do {
+      for (uint8_t index = 3; index < 5; ++index) {
+        const int16_t boxX = P_AQI_BAR_FIRST_BOX_X +
+                             index * (P_AQI_BOX_WIDTH + P_AQI_BOX_GAP);
+        const bool active = aqiAvailable && aqi >= index + 1;
+        display.fillRect(boxX, P_AQI_BAR_Y, P_AQI_BOX_WIDTH, P_AQI_BOX_HEIGHT,
+                         GxEPD_WHITE);
+        if (active && alertVisible) {
+          display.fillRect(boxX, P_AQI_BAR_Y, P_AQI_BOX_WIDTH, P_AQI_BOX_HEIGHT,
+                           GxEPD_BLACK);
+        } else {
+          display.drawRect(boxX, P_AQI_BAR_Y, P_AQI_BOX_WIDTH, P_AQI_BOX_HEIGHT,
+                           GxEPD_BLACK);
+        }
+      }
+    } while (display.nextPage());
+    return;
+  }
   display.setPartialWindow(208, 88, 48, 16);
   display.firstPage();
   do {
@@ -176,26 +281,38 @@ uint8_t wifiStrengthArcs() {
   return 1;
 }
 
-void drawWifiStatusIcon(int16_t x, int16_t y, bool connected) {
-  const int16_t centerX = x + 10;
-  const int16_t centerY = y + 8;
-  const uint8_t arcs = wifiStrengthArcs();
+// Windows-Stil: 90°-Fächer aus dicken Bögen über einem Punkt.
+// Aktive Bögen voll, inaktive gerastert (wirkt auf E-Paper grau).
+const int16_t WIFI_ICON_WIDTH = 25;
 
-  if (arcs >= 3) {
-    display.drawCircleHelper(centerX, centerY, 9, 0x03, GxEPD_WHITE);
-    display.drawCircleHelper(centerX, centerY, 8, 0x03, GxEPD_WHITE);
+void drawWifiStatusIcon(int16_t x, int16_t y, bool connected) {
+  const int16_t centerX = x + 12;
+  const int16_t centerY = y + 20;
+  const uint8_t arcs = connected ? wifiStrengthArcs() : 0;
+  const float bands[3][2] = {{4.5f, 7.5f}, {9.5f, 12.5f}, {14.5f, 17.5f}};
+
+  for (int16_t dy = -18; dy <= 0; ++dy) {
+    for (int16_t dx = -13; dx <= 13; ++dx) {
+      if (abs(dx) > -dy) continue;                    // nur 90°-Fächer nach oben
+      const float r = sqrtf(float(dx * dx + dy * dy));
+      for (uint8_t band = 0; band < 3; ++band) {
+        if (r < bands[band][0] || r > bands[band][1]) continue;
+        const bool active = band < arcs;
+        if (active || ((dx + dy) & 1) == 0) {
+          display.drawPixel(centerX + dx, centerY + dy, GxEPD_WHITE);
+        }
+      }
+    }
   }
-  if (arcs >= 2) {
-    display.drawCircleHelper(centerX, centerY, 6, 0x03, GxEPD_WHITE);
-    display.drawCircleHelper(centerX, centerY, 5, 0x03, GxEPD_WHITE);
-  }
-  if (arcs >= 1) {
-    display.drawCircleHelper(centerX, centerY, 3, 0x03, GxEPD_WHITE);
-    display.drawCircleHelper(centerX, centerY, 2, 0x03, GxEPD_WHITE);
-  }
-  display.fillCircle(centerX, centerY + 7, 1, GxEPD_WHITE);
-  if (!connected) {
-    display.drawLine(x + 3, y + 2, x + 17, y + 16, GxEPD_WHITE);
+  display.fillCircle(centerX, centerY, 2, GxEPD_WHITE);
+
+  if (!connected) {                                   // kleines X unten rechts
+    const int16_t crossX = x + 18;
+    const int16_t crossY = y + 15;
+    display.drawLine(crossX, crossY, crossX + 5, crossY + 5, GxEPD_WHITE);
+    display.drawLine(crossX + 1, crossY, crossX + 6, crossY + 5, GxEPD_WHITE);
+    display.drawLine(crossX + 5, crossY, crossX, crossY + 5, GxEPD_WHITE);
+    display.drawLine(crossX + 6, crossY, crossX + 1, crossY + 5, GxEPD_WHITE);
   }
 }
 
@@ -209,6 +326,26 @@ bool initializeENS160() {
   ens160.setTempAndHum(fallbackTemperatureC, fallbackHumidityPercent);
   Serial.println("SEN0515 ready.");
   return true;
+}
+
+bool initializeHDC1008();
+
+// ENS160 per Opmode 0xF0 zuruecksetzen, dann beide Sensoren neu initialisieren.
+void restartSensors() {
+  Serial.println("Restarting sensors...");
+  if (ens160Ready) {
+    ens160.setPWRMode(0xF0);   // ENS160 Reset
+    delay(10);
+  }
+  ens160Ready = false;
+  hdc1008Ready = false;
+  resetMedian(tvocMedian);
+  resetMedian(eco2Median);
+  gasValuesInitialized = false;
+  if (!simulateSensorData) {
+    hdc1008Ready = initializeHDC1008();
+    ens160Ready = initializeENS160();
+  }
 }
 
 bool initializeHDC1008() {
@@ -242,12 +379,17 @@ SensorReading readSensors() {
         ? 22.0f + 1.5f * sinf(phase / 8.0f) : simulatedTemperatureC;
     reading.humidity = simulateValuesAutomatically
         ? 45.0f + 8.0f * sinf(phase / 10.0f) : simulatedHumidityPercent;
-    reading.tvoc = simulateValuesAutomatically
-        ? static_cast<uint16_t>(180.0f + 90.0f * (1.0f + sinf(gasPhase / 4.0f)))
-        : simulatedTvoc;
-    reading.eco2 = simulateValuesAutomatically
-        ? static_cast<uint16_t>(430.0f + 140.0f * (1.0f + sinf(gasPhase / 6.0f)))
-        : simulatedEco2;
+    if (gasSampleDue()) {
+      const uint16_t rawTvoc = simulateValuesAutomatically
+          ? static_cast<uint16_t>(180.0f + 90.0f * (1.0f + sinf(gasPhase / 4.0f)))
+          : simulatedTvoc;
+      const uint16_t rawEco2 = simulateValuesAutomatically
+          ? static_cast<uint16_t>(500.0f + 600.0f * (1.0f + sinf(gasPhase / 6.0f)))
+          : simulatedEco2;
+      storeGasSample(rawTvoc, rawEco2);
+    }
+    reading.tvoc = cachedTvoc;
+    reading.eco2 = cachedEco2;
     return reading;
   }
 
@@ -260,7 +402,7 @@ SensorReading readSensors() {
     const float humidity = hdc1008.readHumidity();
     if (isfinite(temperature) && isfinite(humidity)) {
       reading.climateAvailable = true;
-      reading.temperature = temperature;
+      reading.temperature = temperature + temperatureOffsetC;
       reading.humidity = humidity;
     }
   }
@@ -285,17 +427,13 @@ SensorReading readSensors() {
   reading.ens160Available = true;
   reading.status = ens160.getENS160Status();
   reading.aqi = ens160.getAQI();
-  if (!gasValuesInitialized ||
-      millis() - lastGasValueUpdateMillis >= GAS_VALUE_UPDATE_INTERVAL_MS) {
-    cachedTvoc = ens160.getTVOC();
-    cachedEco2 = ens160.getECO2();
-    lastGasValueUpdateMillis = millis();
-    gasValuesInitialized = true;
+  if (gasSampleDue()) {
+    storeGasSample(ens160.getTVOC(), ens160.getECO2());
   }
   reading.tvoc = cachedTvoc;
   reading.eco2 = cachedEco2;
   if (simulateAqiTest) {
-  reading.status = 0;
+    reading.status = 0;
     reading.aqi = simulatedAqiTestValue();
   }
   return reading;
@@ -329,8 +467,86 @@ void logStatus(const SensorReading& reading, const struct tm* currentTime) {
   }
 }
 
+const char* ratingText(const SensorReading& reading) {
+  if (!reading.ens160Available) return "Kein Sensor";
+  if (reading.status == 1) return "Aufw\xC3\xA4" "rmen...";
+  if (reading.status == 2) return "Anlaufphase";
+  if (reading.status == 0) return aqiLabel(reading.aqi);
+  return "Messfehler";
+}
+
+void drawRightAlignedText(const char* text, int16_t rightX, int16_t baseline,
+                          const uint8_t* font) {
+  textRenderer.setFont(font);
+  drawText(text, rightX - textRenderer.getUTF8Width(text), baseline, font,
+           GxEPD_BLACK);
+}
+
+// Hochformat 176 x 264
+void drawPortraitPage(const SensorReading& reading, const char* dateText,
+                      const char* timeText, const char* ipText,
+                      const char* temperatureText, const char* humidityText,
+                      const char* tvocText, const char* eco2Text) {
+  const int16_t width = display.width();
+
+  display.fillRect(0, 0, width, 46, GxEPD_BLACK);
+  drawText(dateText, 6, 17, FONT_MEDIUM, GxEPD_WHITE);
+  drawText(timeText, 6, 40, FONT_LARGE, GxEPD_WHITE);
+  drawWifiStatusIcon(width - WIFI_ICON_WIDTH - 3, 18,
+                     WiFi.status() == WL_CONNECTED);
+
+  drawCenteredText("Temperatur", 44, 60, FONT_SMALL, GxEPD_BLACK);
+  drawCenteredText("Feuchte", 132, 60, FONT_SMALL, GxEPD_BLACK);
+  drawCenteredValueWithUnit(temperatureText, "\xC2\xB0" "C", 44, 87);
+  drawCenteredValueWithUnit(humidityText, "%", 132, 87);
+  display.drawFastVLine(88, 52, 42, GxEPD_BLACK);
+  display.drawFastHLine(0, 98, width, GxEPD_BLACK);
+  display.drawFastHLine(0, 99, width, GxEPD_BLACK);
+
+  drawCenteredText("Luftqualit\xC3\xA4" "t (AQI)", 88, 112, FONT_SMALL,
+                   GxEPD_BLACK);
+  char aqiText[4] = "--";
+  if (reading.ens160Available) {
+    snprintf(aqiText, sizeof(aqiText), "%u", reading.aqi);
+  }
+  drawCenteredText(aqiText, 34, 142, FONT_LARGE, GxEPD_BLACK);
+  const char* rating = ratingText(reading);
+  textRenderer.setFont(FONT_RATING);
+  const uint8_t* ratingFont =
+      textRenderer.getUTF8Width(rating) <= 106 ? FONT_RATING : FONT_MEDIUM;
+  drawCenteredText(rating, 116, 140, ratingFont, GxEPD_BLACK);
+
+  for (uint8_t index = 0; index < 5; ++index) {
+    const int16_t boxX = P_AQI_BAR_FIRST_BOX_X +
+                         index * (P_AQI_BOX_WIDTH + P_AQI_BOX_GAP);
+    const bool active = reading.ens160Available && reading.aqi >= index + 1;
+    const bool visible = index < 3 || !active || aqiAlertVisible;
+    if (active && visible) {
+      display.fillRect(boxX, P_AQI_BAR_Y, P_AQI_BOX_WIDTH, P_AQI_BOX_HEIGHT,
+                       GxEPD_BLACK);
+    } else {
+      display.drawRect(boxX, P_AQI_BAR_Y, P_AQI_BOX_WIDTH, P_AQI_BOX_HEIGHT,
+                       GxEPD_BLACK);
+    }
+  }
+  display.drawFastHLine(0, 172, width, GxEPD_BLACK);
+  display.drawFastHLine(0, 173, width, GxEPD_BLACK);
+
+  drawText("TVOC", 10, 195, FONT_MEDIUM, GxEPD_BLACK);
+  drawText("ppb", 10, 207, FONT_SMALL, GxEPD_BLACK);
+  drawRightAlignedText(tvocText, width - 10, 205, FONT_LARGE);
+  display.drawFastHLine(10, 214, width - 20, GxEPD_BLACK);
+  drawText("eCO2", 10, 233, FONT_MEDIUM, GxEPD_BLACK);
+  drawText("ppm", 10, 245, FONT_SMALL, GxEPD_BLACK);
+  drawRightAlignedText(eco2Text, width - 10, 243, FONT_LARGE);
+  drawText(ipText, 2, 261, u8g2_font_4x6_tf, GxEPD_BLACK);
+}
+
 void drawDashboard(const SensorReading& reading, const struct tm* currentTime,
                    bool fullRefresh) {
+  displayedReading = reading;
+  displayedTimeValid = currentTime != nullptr;
+  if (displayedTimeValid) displayedTime = *currentTime;
   static const char* const weekdays[] = {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
   char dateText[24] = "--.--.----";
   char timeText[9] = "--:--:--";
@@ -370,6 +586,11 @@ void drawDashboard(const SensorReading& reading, const struct tm* currentTime,
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
+    if (displayPortrait) {
+      drawPortraitPage(reading, dateText, timeText, ipText, temperatureText,
+                       humidityText, tvocText, eco2Text);
+      continue;   // springt zu display.nextPage()
+    }
     display.fillRect(0, 0, display.width(), 29, GxEPD_BLACK);
 
     textRenderer.setFont(FONT_RATING);
@@ -377,7 +598,7 @@ void drawDashboard(const SensorReading& reading, const struct tm* currentTime,
     const int16_t timeWidth = textRenderer.getUTF8Width(timeText);
     const int16_t timeX = display.width() - 7 - timeWidth;
     const int16_t dateEnd = 6 + dateWidth;
-    const int16_t iconWidth = 21;
+    const int16_t iconWidth = WIFI_ICON_WIDTH;
     const int16_t availableGap = timeX - dateEnd;
     drawText(dateText, 6, 22, FONT_RATING, GxEPD_WHITE);
     if (availableGap >= iconWidth) {
@@ -426,7 +647,7 @@ void drawDashboard(const SensorReading& reading, const struct tm* currentTime,
       if (reading.status == 1 ) {
         rating = "Aufw\xC3\xA4" "rmen...";
       } else if (reading.status == 2) {
-        rating ="Anlaufphase;"
+        rating ="Anlaufphase";
       } else if (reading.status == 0) {
         rating = aqiLabel(reading.aqi);
       } else {
@@ -522,6 +743,11 @@ input:checked+.slider2:before{transform:translateX(18px)}
 input[type=range]{-webkit-appearance:none;width:100%;height:6px;border-radius:3px;background:var(--border);outline:none;margin:4px 0}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--primary);cursor:pointer;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.3)}
 input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:var(--primary);cursor:pointer;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.wrap:has(.statuslayout){max-width:1000px}
+.statuslayout{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
+.statuscol{flex:1 1 300px;min-width:0}
+.screencol{flex:0 0 auto;max-width:100%}
+.screencol img{display:block;max-width:100%;border:8px solid #222;border-radius:8px;background:#fff}
 .swatch{width:28px;height:28px;border-radius:50%;border:2px solid var(--border);flex:none}
 )CSS";
 
@@ -585,6 +811,10 @@ void loadPersistentSettings() {
   simulatedAqi = preferences.getUChar("simAqiValue", 3);
   simulatedTvoc = preferences.getUShort("simTvoc", 120);
   simulatedEco2 = preferences.getUShort("simEco2", 540);
+  tvocMedianWindow = constrain(preferences.getUChar("tvocMedian", 10), 1, MEDIAN_MAX_WINDOW);
+  eco2MedianWindow = constrain(preferences.getUChar("eco2Median", 10), 1, MEDIAN_MAX_WINDOW);
+  temperatureOffsetC = constrain(preferences.getFloat("tempOffset", 0.0f), -10.0f, 10.0f);
+  displayPortrait = preferences.getBool("portrait", false);
   preferences.end();
 }
 
@@ -611,6 +841,10 @@ void savePersistentSettings() {
   preferences.putUChar("simAqiValue", simulatedAqi);
   preferences.putUShort("simTvoc", simulatedTvoc);
   preferences.putUShort("simEco2", simulatedEco2);
+  preferences.putUChar("tvocMedian", tvocMedianWindow);
+  preferences.putUChar("eco2Median", eco2MedianWindow);
+  preferences.putFloat("tempOffset", temperatureOffsetC);
+  preferences.putBool("portrait", displayPortrait);
   preferences.end();
 }
 
@@ -625,9 +859,202 @@ void appendStatusStat(String& body, const char* label, const String& value,
   body += F("</div></div>");
 }
 
+// ---------- Web-Abbild des E-Paper-Displays (SVG) ----------
+
+void svgText(String& svg, int16_t x, int16_t y, uint8_t size, const String& text,
+             const char* anchor = "start", bool white = false,
+             bool bold = true) {
+  char head[160];
+  snprintf(head, sizeof(head),
+           "<text x='%d' y='%d' font-size='%u' text-anchor='%s' fill='%s'%s>",
+           x, y, size, anchor, white ? "#fff" : "#000",
+           bold ? " font-weight='bold'" : "");
+  svg += head;
+  svg += escapeHtml(text);
+  svg += F("</text>");
+}
+
+void svgValueWithUnit(String& svg, int16_t centerX, int16_t y,
+                      const String& value, const String& unit) {
+  char head[120];
+  snprintf(head, sizeof(head),
+           "<text x='%d' y='%d' font-size='25' font-weight='bold' "
+           "text-anchor='middle'>", centerX, y);
+  svg += head;
+  svg += escapeHtml(value);
+  svg += F("<tspan font-size='14' dx='5'>");
+  svg += escapeHtml(unit);
+  svg += F("</tspan></text>");
+}
+
+void svgRect(String& svg, int16_t x, int16_t y, int16_t w, int16_t h,
+             bool filled, const char* extraClass = "") {
+  char buffer[160];
+  if (filled) {
+    snprintf(buffer, sizeof(buffer),
+             "<rect x='%d' y='%d' width='%d' height='%d' fill='#000' class='%s'/>",
+             x, y, w, h, extraClass);
+  } else {
+    snprintf(buffer, sizeof(buffer),
+             "<rect x='%.1f' y='%.1f' width='%d' height='%d' fill='none' "
+             "stroke='#000' stroke-width='1'/>",
+             x + 0.5f, y + 0.5f, w - 1, h - 1);
+  }
+  svg += buffer;
+}
+
+void svgWifiIcon(String& svg, int16_t x, int16_t y, bool connected) {
+  const float cx = x + 12;
+  const float cy = y + 20;
+  const uint8_t arcs = connected ? wifiStrengthArcs() : 0;
+  const float radii[3] = {6.0f, 11.0f, 16.0f};
+  char buffer[200];
+  for (uint8_t band = 0; band < 3; ++band) {
+    const float r = radii[band];
+    const float d = r * 0.7071f;
+    snprintf(buffer, sizeof(buffer),
+             "<path d='M%.1f %.1f A%.1f %.1f 0 0 1 %.1f %.1f' fill='none' "
+             "stroke='#fff' stroke-width='3'%s/>",
+             cx - d, cy - d, r, r, cx + d, cy - d,
+             band < arcs ? "" : " stroke-dasharray='1.5 1.5'");
+    svg += buffer;
+  }
+  snprintf(buffer, sizeof(buffer),
+           "<circle cx='%.1f' cy='%.1f' r='2.5' fill='#fff'/>", cx, cy);
+  svg += buffer;
+  if (!connected) {
+    snprintf(buffer, sizeof(buffer),
+             "<path d='M%d %d l6 6 M%d %d l-6 6' stroke='#fff' stroke-width='2'/>",
+             x + 18, y + 15, x + 24, y + 15);
+    svg += buffer;
+  }
+}
+
+void svgAqiBoxes(String& svg, const SensorReading& reading, int16_t firstX,
+                 int16_t y, int16_t w, int16_t h, int16_t gap) {
+  for (uint8_t index = 0; index < 5; ++index) {
+    const int16_t boxX = firstX + index * (w + gap);
+    const bool active = reading.ens160Available && reading.aqi >= index + 1;
+    svgRect(svg, boxX, y, w, h, false);
+    if (active) {
+      svgRect(svg, boxX, y, w, h, true, index >= 3 ? "blink" : "");
+    }
+  }
+}
+
+String renderDisplaySvg() {
+  const SensorReading& reading = displayedReading;
+  static const char* const weekdays[] = {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
+  char dateText[24] = "--.--.----";
+  char timeText[9] = "--:--:--";
+  String ipText = "IP: --";
+  String temperatureText = "--.-";
+  String humidityText = "--";
+  String tvocText = "----";
+  String eco2Text = "----";
+  String aqiText = "--";
+
+  if (displayedTimeValid) {
+    snprintf(dateText, sizeof(dateText), "%s %02d.%02d.%04d",
+             weekdays[displayedTime.tm_wday], displayedTime.tm_mday,
+             displayedTime.tm_mon + 1, displayedTime.tm_year + 1900);
+    strftime(timeText, sizeof(timeText), "%H:%M:%S", &displayedTime);
+  }
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  if (wifiConnected) ipText = "IP:" + WiFi.localIP().toString();
+  if (reading.climateAvailable) {
+    temperatureText = String(reading.temperature, 1);
+    humidityText = String(reading.humidity, 0);
+  }
+  if (reading.ens160Available) {
+    tvocText = String(reading.tvoc);
+    eco2Text = String(reading.eco2);
+    aqiText = String(reading.aqi);
+  }
+  const String rating = ratingText(reading);
+  const uint8_t ratingSize = rating.length() <= 10 ? 19 : 14;
+
+  const int16_t width = displayPortrait ? 176 : 264;
+  const int16_t height = displayPortrait ? 264 : 176;
+  String svg;
+  svg.reserve(4500);
+  char head[300];
+  snprintf(head, sizeof(head),
+           "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 %d %d' "
+           "width='%d' height='%d' font-family='Helvetica,Arial,sans-serif'>"
+           "<style>.blink{animation:b 1s steps(1) infinite}"
+           "@keyframes b{50%%{opacity:0}}</style>"
+           "<rect width='%d' height='%d' fill='#fff'/>",
+           width, height, width, height, width, height);
+  svg += head;
+
+  if (displayPortrait) {
+    svgRect(svg, 0, 0, width, 46, true);
+    svgText(svg, 6, 17, 14, dateText, "start", true);
+    svgText(svg, 6, 40, 25, timeText, "start", true);
+    svgWifiIcon(svg, width - WIFI_ICON_WIDTH - 3, 18, wifiConnected);
+
+    svgText(svg, 44, 60, 11, "Temperatur", "middle");
+    svgText(svg, 132, 60, 11, "Feuchte", "middle");
+    svgValueWithUnit(svg, 44, 87, temperatureText, "\xC2\xB0" "C");
+    svgValueWithUnit(svg, 132, 87, humidityText, "%");
+    svgRect(svg, 88, 52, 1, 42, true);
+    svgRect(svg, 0, 98, width, 2, true);
+
+    svgText(svg, 88, 112, 11, "Luftqualit\xC3\xA4" "t (AQI)", "middle");
+    svgText(svg, 34, 142, 25, aqiText, "middle");
+    svgText(svg, 116, 140, ratingSize, rating, "middle");
+    svgAqiBoxes(svg, reading, P_AQI_BAR_FIRST_BOX_X, P_AQI_BAR_Y,
+                P_AQI_BOX_WIDTH, P_AQI_BOX_HEIGHT, P_AQI_BOX_GAP);
+    svgRect(svg, 0, 172, width, 2, true);
+
+    svgText(svg, 10, 195, 14, "TVOC");
+    svgText(svg, 10, 207, 11, "ppb");
+    svgText(svg, width - 10, 205, 25, tvocText, "end");
+    svgRect(svg, 10, 214, width - 20, 1, true);
+    svgText(svg, 10, 233, 14, "eCO2");
+    svgText(svg, 10, 245, 11, "ppm");
+    svgText(svg, width - 10, 243, 25, eco2Text, "end");
+    svgText(svg, 2, 261, 7, ipText, "start", false, false);
+  } else {
+    svgRect(svg, 0, 0, width, 29, true);
+    svgText(svg, 6, 22, 19, dateText, "start", true);
+    svgWifiIcon(svg, 140, 3, wifiConnected);
+    svgText(svg, width - 7, 22, 19, timeText, "end", true);
+
+    svgText(svg, 66, 43, 11, "Temperatur", "middle");
+    svgText(svg, 198, 43, 11, "Feuchte", "middle");
+    svgValueWithUnit(svg, 66, 70, temperatureText, "\xC2\xB0" "C");
+    svgValueWithUnit(svg, 198, 70, humidityText, "%");
+    svgRect(svg, 132, 35, 1, 41, true);
+    svgRect(svg, 0, 80, width, 2, true);
+
+    svgText(svg, 66, 93, 11, "Luftqualit\xC3\xA4" "t (AQI)", "middle");
+    svgAqiBoxes(svg, reading, AQI_BAR_FIRST_BOX_X, AQI_BAR_Y,
+                AQI_BOX_WIDTH, AQI_BOX_HEIGHT, AQI_BOX_GAP);
+    svgText(svg, 66, 121, 25, aqiText, "middle");
+    svgText(svg, 198, 120, ratingSize, rating, "middle");
+
+    svgRect(svg, 0, 129, width, 2, true);
+    svgRect(svg, 132, 134, 1, 42, true);
+    svgText(svg, 66, 142, 11, "TVOC (ppb)", "middle");
+    svgText(svg, 198, 142, 11, "eCO2 (ppm)", "middle");
+    svgText(svg, 66, 168, 25, tvocText, "middle");
+    svgText(svg, 198, 168, 25, eco2Text, "middle");
+    svgText(svg, 2, 175, 7, ipText, "start", false, false);
+  }
+  svg += F("</svg>");
+  return svg;
+}
+
+void handleDisplaySvg() {
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "image/svg+xml; charset=utf-8", renderDisplaySvg());
+}
+
 void handleStatusPage() {
   String body = F("<h2>Status <span class='pill ok'>OK</span></h2>"
-                  "<div class='statgrid'>");
+                  "<div class='statuslayout'><div class='statuscol'><div class='statgrid'>");
   appendStatusStat(body, "Zustand", "Sensoranzeige aktiv");
   const bool wifiConnected = WiFi.status() == WL_CONNECTED;
   appendStatusStat(body, "WLAN", wifiConnected ? "Verbunden" : "Getrennt",
@@ -655,7 +1082,16 @@ void handleStatusPage() {
   appendStatusStat(body, "MQTT", mqttEnabled
       ? (mqttClient.connected() ? "Verbunden" : "Getrennt") : "Deaktiviert",
       mqttEnabled && !mqttClient.connected());
-  body += F("</div>");
+  body += F("</div></div><div class='screencol'>"
+            "<img id='epd' src='/display.svg' alt='Display' style='width:");
+  body += displayPortrait ? F("264px") : F("396px");
+  body += F("'></div></div>"
+            "<script>setInterval(function(){"
+            "document.getElementById('epd').src='/display.svg?t='+Date.now();"
+            "fetch('/?t='+Date.now(),{cache:'no-store'}).then(function(r){return r.text()})"
+            ".then(function(h){var d=new DOMParser().parseFromString(h,'text/html');"
+            "var n=d.querySelector('.statgrid'),o=document.querySelector('.statgrid');"
+            "if(n&&o)o.innerHTML=n.innerHTML}).catch(function(){})},2000)</script>");
   sendPage("Status", body);
 }
 
@@ -665,18 +1101,33 @@ void handleParametersPage() {
                   "<div class='row'><label for='refresh'>Display-Refresh (Sekunden)</label>"
                   "<input id='refresh' name='refresh' type='number' min='1' max='3600' value='");
   body += String(dashboardRefreshIntervalMs / 1000UL);
-  body += F("' required></div><div class='row'><div class='rowhead'><label for='brightness'>LED-Helligkeit</label><span class='val' id='brightnessValue'>");
+  body += F("' required></div><label class='chk'><input name='portrait' type='checkbox' value='1'");
+  if (displayPortrait) body += F(" checked");
+  body += F("> Display hochkant (90&deg; gedreht)</label>");
+  body += F("<div class='row'><div class='rowhead'><label for='brightness'>LED-Helligkeit</label><span class='val' id='brightnessValue'>");
   body += String(aqiLedBrightness);
   body += F("</span></div><input id='brightness' name='brightness' type='range' min='1' max='255' value='");
   body += String(aqiLedBrightness);
   body += F("' oninput=\"document.getElementById('brightnessValue').textContent=this.value\"></div>");
+  body += F("<div class='row'><label for='tempOffset'>Temperatur-Kompensation (C)</label>"
+            "<input id='tempOffset' name='tempOffset' type='number' min='-10' max='10' step='0.1' value='");
+  body += String(temperatureOffsetC, 1);
+  body += F("' required><div class='hint'>Wird zur gemessenen Temperatur addiert, z. B. -1.5 bei Eigenerwärmung.</div></div>");
   body += F("<div class='row'><label for='fallbackTemp'>HDC1008 Fallback Temperatur (C)</label>"
             "<input id='fallbackTemp' name='fallbackTemp' type='number' min='-40' max='125' step='0.1' value='");
   body += String(fallbackTemperatureC, 1);
   body += F("' required></div><div class='row'><label for='fallbackHum'>HDC1008 Fallback Feuchte (%)</label>"
             "<input id='fallbackHum' name='fallbackHum' type='number' min='0' max='100' step='0.1' value='");
   body += String(fallbackHumidityPercent, 1);
-  body += F("' required></div><div class='subcard'><h3>Simulation</h3>"
+  body += F("' required></div><div class='subcard'><h3>Median-Filter</h3>"
+            "<div class='row'><label for='tvocMedian'>TVOC Fenster (Samples, 1 = aus)</label>"
+            "<input id='tvocMedian' name='tvocMedian' type='number' min='1' max='15' step='1' value='");
+  body += String(tvocMedianWindow);
+  body += F("' required></div><div class='row'><label for='eco2Median'>eCO2 Fenster (Samples, 1 = aus)</label>"
+            "<input id='eco2Median' name='eco2Median' type='number' min='1' max='15' step='1' value='");
+  body += String(eco2MedianWindow);
+  body += F("' required></div><div class='hint'>1 Sample pro Sekunde. Ungerade Werte (3, 5, 7 ...) empfohlen.</div></div>"
+            "<div class='subcard'><h3>Simulation</h3>"
             "<label class='chk'><input name='simulateSensorData' type='checkbox' value='1'");
   if (simulateSensorData) body += F(" checked");
   body += F("> Sensorwerte simulieren</label>"
@@ -702,7 +1153,13 @@ void handleParametersPage() {
             "<input id='simEco2' name='simEco2' type='number' min='0' max='65535' step='1' value='");
   body += String(simulatedEco2);
   body += F("'></div><div class='hint'>Automatische Werte: AQI-Test alle 10 s, Klima alle 10 s, TVOC/eCO2 alle 5 s. Bei deaktivierter Automatik bleiben die eingegebenen Werte konstant.</div></div>"
-            "<button class='btn' type='submit'>Speichern</button></form>");
+            "<button class='btn' type='submit'>Speichern</button></form>"
+            "<div class='subcard'><h3>Neustart</h3><div class='actionbar'>"
+            "<form method='post' action='/restart-sensors'>"
+            "<button class='btn secondary' type='submit'>Sensoren neu starten</button></form>"
+            "<form method='post' action='/restart' onsubmit=\"return confirm('Gerät neu starten?')\">"
+            "<button class='btn secondary' type='submit'>Gerät neu starten</button></form>"
+            "</div><div class='hint'>Nach dem Sensor-Neustart braucht der ENS160 einige Minuten Aufwärmzeit.</div></div>");
   sendPage("Parameter", body);
 }
 
@@ -712,26 +1169,38 @@ void handleParametersSave() {
   const long brightness = webServer.arg("brightness").toInt();
   const float fallbackTemp = webServer.arg("fallbackTemp").toFloat();
   const float fallbackHum = webServer.arg("fallbackHum").toFloat();
-    const float simTemp = webServer.arg("simTemp").toFloat();
-    const float simHum = webServer.arg("simHum").toFloat();
-    const long simAqi = webServer.arg("simAqi").toInt();
-    const long simTvoc = webServer.arg("simTvoc").toInt();
-    const long simEco2 = webServer.arg("simEco2").toInt();
+  const float simTemp = webServer.arg("simTemp").toFloat();
+  const float simHum = webServer.arg("simHum").toFloat();
+  const long simAqi = webServer.arg("simAqi").toInt();
+  const long simTvoc = webServer.arg("simTvoc").toInt();
+  const long simEco2 = webServer.arg("simEco2").toInt();
+  const long tvocWindow = webServer.arg("tvocMedian").toInt();
+  const long eco2Window = webServer.arg("eco2Median").toInt();
+  const float tempOffset = webServer.arg("tempOffset").toFloat();
   if (refreshSeconds < 1 || refreshSeconds > 3600 || brightness < 1 ||
       brightness > 255 || !isfinite(fallbackTemp) || fallbackTemp < -40 ||
       fallbackTemp > 125 || !isfinite(fallbackHum) || fallbackHum < 0 ||
       fallbackHum > 100 || !isfinite(simTemp) || simTemp < -40 ||
       simTemp > 125 || !isfinite(simHum) || simHum < 0 || simHum > 100 ||
       simAqi < 1 || simAqi > 5 || simTvoc < 0 || simTvoc > 65535 ||
-      simEco2 < 0 || simEco2 > 65535) {
+      simEco2 < 0 || simEco2 > 65535 ||
+      tvocWindow < 1 || tvocWindow > MEDIAN_MAX_WINDOW ||
+      eco2Window < 1 || eco2Window > MEDIAN_MAX_WINDOW ||
+      !isfinite(tempOffset) || tempOffset < -10 || tempOffset > 10) {
     sendPage("Parameter", F("<h2>Parameter</h2><p class='msg info'>Ungültige Werte. "
                             "Refresh 1-3600 s, LED 1-255, Temperatur -40 bis 125 C, "
-                            "Feuchte 0 bis 100 %.</p>"), 400);
+                            "Feuchte 0 bis 100 %, Median-Fenster 1-15, Kompensation -10 bis 10 C.</p>"), 400);
     return;
   }
 
   dashboardRefreshIntervalMs = static_cast<uint32_t>(refreshSeconds) * 1000UL;
   aqiLedBrightness = static_cast<uint8_t>(brightness);
+  temperatureOffsetC = tempOffset;
+  const bool portrait = webServer.hasArg("portrait");
+  if (portrait != displayPortrait) {
+    displayPortrait = portrait;
+    displayLayoutChanged = true;
+  }
   fallbackTemperatureC = fallbackTemp;
   fallbackHumidityPercent = fallbackHum;
   simulateSensorData = webServer.hasArg("simulateSensorData");
@@ -742,6 +1211,10 @@ void handleParametersSave() {
   simulatedAqi = static_cast<uint8_t>(simAqi);
   simulatedTvoc = static_cast<uint16_t>(simTvoc);
   simulatedEco2 = static_cast<uint16_t>(simEco2);
+  if (tvocWindow != tvocMedianWindow) resetMedian(tvocMedian);
+  if (eco2Window != eco2MedianWindow) resetMedian(eco2Median);
+  tvocMedianWindow = static_cast<uint8_t>(tvocWindow);
+  eco2MedianWindow = static_cast<uint8_t>(eco2Window);
   aqiPixels.setBrightness(aqiLedBrightness);
   updateAqiPixels(latestReading);
   if (ens160Ready) {
@@ -749,6 +1222,20 @@ void handleParametersSave() {
   }
   savePersistentSettings();
   sendPage("Parameter", F("<h2>Parameter</h2><p class='msg ok'>Einstellungen gespeichert.</p>"));
+}
+
+void handleSensorRestart() {
+  if (!requireWebAdmin()) return;
+  sensorRestartPending = true;
+  sendPage("Parameter", F("<h2>Parameter</h2><p class='msg ok'>Sensoren werden neu gestartet.</p>"
+                          "<p><a href='/params'>Zurück</a></p>"));
+}
+
+void handleDeviceRestart() {
+  if (!requireWebAdmin()) return;
+  sendPage("Parameter", F("<h2>Parameter</h2><p class='msg ok'>Gerät startet neu...</p>"));
+  delay(700);
+  ESP.restart();
 }
 
 void handleWifiPage() {
@@ -861,12 +1348,14 @@ void publishMqttDiscovery() {
   const String id = mqttDeviceId();
   const String stateTopic = mqttBaseTopic + "/" + id;
   const String availabilityTopic = stateTopic + "/availability";
-  const char* suffixes[] = {"aqi", "temperature", "humidity"};
-  const char* names[] = {"AQI", "Temperature", "Humidity"};
-  const char* classes[] = {"aqi", "temperature", "humidity"};
-  const char* units[] = {"", "\\u00B0C", "%"};
+  const char* suffixes[] = {"aqi", "temperature", "humidity", "tvoc", "eco2"};
+  const char* names[] = {"AQI", "Temperature", "Humidity", "TVOC", "eCO2"};
+  const char* classes[] = {"aqi", "temperature", "humidity",
+                           "volatile_organic_compounds_parts", "carbon_dioxide"};
+  const char* units[] = {"", "\\u00B0C", "%", "ppb", "ppm"};
 
-  for (uint8_t index = 0; index < 3; ++index) {
+  for (uint8_t index = 0; index < 5; ++index) {
+    const bool hasUnit = units[index][0] != '\0';
     char discoveryTopic[160];
     char payload[700];
     snprintf(discoveryTopic, sizeof(discoveryTopic),
@@ -877,11 +1366,12 @@ void publishMqttDiscovery() {
              "\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
              "\"dev_cla\":\"%s\",\"dev\":{\"ids\":[\"airq_%s\"],"
              "\"name\":\"AIRQ Sensor\",\"mf\":\"ESP32\","
-             "\"mdl\":\"Waveshare e-Paper Monitor\"}%s%s%s}",
+             "\"mdl\":\"Waveshare e-Paper Monitor\"},"
+             "\"stat_cla\":\"measurement\"%s%s%s}",
              names[index], id.c_str(), suffixes[index], stateTopic.c_str(),
              suffixes[index], availabilityTopic.c_str(), classes[index], id.c_str(),
-             index == 1 || index == 2 ? ",\"unit_of_meas\":\"" : "",
-             units[index], index == 1 || index == 2 ? "\"" : "");
+             hasUnit ? ",\"unit_of_meas\":\"" : "",
+             units[index], hasUnit ? "\"" : "");
     mqttClient.publish(discoveryTopic, payload, true);
   }
 }
@@ -931,6 +1421,10 @@ void publishMqttReadings(const SensorReading& reading) {
   if (reading.ens160Available) {
     snprintf(value, sizeof(value), "%u", reading.aqi);
     mqttClient.publish((prefix + "aqi").c_str(), value, true);
+    snprintf(value, sizeof(value), "%u", reading.tvoc);
+    mqttClient.publish((prefix + "tvoc").c_str(), value, true);
+    snprintf(value, sizeof(value), "%u", reading.eco2);
+    mqttClient.publish((prefix + "eco2").c_str(), value, true);
   }
   if (reading.climateAvailable) {
     snprintf(value, sizeof(value), "%.1f", reading.temperature);
@@ -943,11 +1437,47 @@ void publishMqttReadings(const SensorReading& reading) {
 
 void handleFirmwarePage() {
   if (!requireWebAdmin()) return;
-  sendPage("Firmware", F("<h2>Firmware</h2><p class='hint'>PlatformIO-Datei firmware.bin auswählen.</p>"
-                          "<form method='post' action='/firmware' enctype='multipart/form-data'>"
-                          "<div class='row'><label for='firmware'>Firmware-Datei</label>"
-                          "<input id='firmware' name='firmware' type='file' accept='.bin' required></div>"
-                          "<button class='btn' type='submit'>Hochladen und installieren</button></form>"));
+  sendPage("Firmware", F(
+      "<h2>Firmware</h2>"
+      "<div id='fwForm'><p class='hint'>PlatformIO-Datei firmware.bin auswählen.</p>"
+      "<form id='fwUpload' method='post' action='/firmware' enctype='multipart/form-data'>"
+      "<div class='row'><label for='firmware'>Firmware-Datei</label>"
+      "<input id='firmware' name='firmware' type='file' accept='.bin' required></div>"
+      "<button class='btn' type='submit'>Hochladen und installieren</button></form></div>"
+      "<div id='fwStatus' style='display:none'>"
+      "<p id='fwFile' class='hint'></p>"
+      "<div class='subcard'><h3>1. Datei hochladen</h3>"
+      "<div style='height:10px;background:var(--border);border-radius:5px;overflow:hidden'>"
+      "<div id='fwBar' style='height:100%;width:0;background:var(--primary);transition:width .2s'></div></div>"
+      "<p id='fwUp' style='margin:8px 0 0'>0 %</p></div>"
+      "<div class='subcard'><h3>2. Firmware einspielen</h3><p id='fwInst' style='margin:0'>Wartet auf Upload...</p></div>"
+      "<div class='subcard'><h3>3. Neustart</h3><p id='fwBoot' style='margin:0'>Wartet...</p></div>"
+      "<div class='actionbar' id='fwRetry' style='display:none'>"
+      "<a class='btn secondary' href='/firmware'>Erneut versuchen</a></div></div>"
+      "<script>"
+      "var f=document.getElementById('fwUpload');"
+      "function $(i){return document.getElementById(i)}"
+      "function fail(t){$('fwInst').innerHTML=\"<span class='pill err'>Fehler</span> \"+t;$('fwRetry').style.display='flex';}"
+      "function waitBoot(n){fetch('/',{cache:'no-store'}).then(function(r){"
+      "$('fwBoot').innerHTML=\"<span class='pill ok'>Fertig</span> Ger\\u00e4t l\\u00e4uft wieder. Weiter zur Statusseite...\";"
+      "setTimeout(function(){location.href='/'},1500)}).catch(function(){"
+      "$('fwBoot').textContent='Ger\\u00e4t startet neu... ('+n+' s)';setTimeout(function(){waitBoot(n+2)},2000)})}"
+      "f.onsubmit=function(e){e.preventDefault();var file=$('firmware').files[0];if(!file)return;"
+      "$('fwForm').style.display='none';$('fwStatus').style.display='block';"
+      "$('fwFile').textContent='Datei: '+file.name+' ('+Math.round(file.size/1024)+' KB)';"
+      "var x=new XMLHttpRequest();x.open('POST','/firmware');"
+      "x.upload.onprogress=function(ev){if(!ev.lengthComputable)return;var p=Math.round(ev.loaded*100/ev.total);"
+      "$('fwBar').style.width=p+'%';$('fwUp').textContent=p+' %';"
+      "$('fwInst').textContent='Wird w\\u00e4hrend des Uploads in den Flash geschrieben...'};"
+      "x.upload.onload=function(){$('fwUp').innerHTML=\"<span class='pill ok'>Hochgeladen</span> Datei vollst\\u00e4ndig \\u00fcbertragen.\";"
+      "$('fwInst').textContent='Firmware wird gepr\\u00fcft und aktiviert...'};"
+      "x.onload=function(){if(x.status==200){"
+      "$('fwInst').innerHTML=\"<span class='pill ok'>Installiert</span> Firmware erfolgreich eingespielt.\";"
+      "$('fwBoot').textContent='Ger\\u00e4t startet neu...';setTimeout(function(){waitBoot(4)},4000)}"
+      "else{fail('Update fehlgeschlagen (HTTP '+x.status+'). Seriellen Monitor pr\\u00fcfen.')}};"
+      "x.onerror=function(){fail('Verbindung abgebrochen.')};"
+      "var d=new FormData();d.append('firmware',file);x.send(d)};"
+      "</script>"));
 }
 
 void handleFirmwareUpload() {
@@ -991,8 +1521,11 @@ void handleFirmwareResult() {
 
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleStatusPage);
+  webServer.on("/display.svg", HTTP_GET, handleDisplaySvg);
   webServer.on("/params", HTTP_GET, handleParametersPage);
   webServer.on("/params", HTTP_POST, handleParametersSave);
+  webServer.on("/restart-sensors", HTTP_POST, handleSensorRestart);
+  webServer.on("/restart", HTTP_POST, handleDeviceRestart);
   webServer.on("/wifi", HTTP_GET, handleWifiPage);
   webServer.on("/wifi", HTTP_POST, handleWifiSave);
   webServer.on("/mqtt", HTTP_GET, handleMqttPage);
@@ -1063,7 +1596,7 @@ void setup() {
 
   SPI.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, EPD_CS_PIN);
   display.init(115200, true, 2, false);
-  display.setRotation(1);
+  display.setRotation(displayRotation());
   textRenderer.begin(display);
   textRenderer.setFontMode(1);
 
@@ -1098,14 +1631,23 @@ void loop() {
   webServer.handleClient();
   applyPendingNetworkSettings();
   maintainMqttConnection();
+  if (sensorRestartPending) {
+    sensorRestartPending = false;
+    restartSensors();
+  }
 
   struct tm currentTime;
   const bool clockAvailable = readClock(currentTime);
   const uint32_t refreshStartedAt = millis();
   const bool dashboardRefreshDue =
       refreshStartedAt - lastRefreshMillis >= dashboardRefreshIntervalMs;
+  if (displayLayoutChanged) {
+    display.setRotation(displayRotation());
+  }
   const bool fullRefreshDue =
-      refreshStartedAt - lastFullRefreshMillis >= 1800000UL;
+      refreshStartedAt - lastFullRefreshMillis >= 1800000UL ||
+      displayLayoutChanged;
+  displayLayoutChanged = false;
 
   if (dashboardRefreshDue || fullRefreshDue) {
     const SensorReading reading = readSensors();
@@ -1115,9 +1657,10 @@ void loop() {
     if (aqiChanged) {
       aqiAlertVisible = true;
       lastAqiBlinkMillis = millis();
-      updateAqiPixels(reading);
     }
+    updateAqiPixels(reading);
     displayedAqi = reading.aqi;
+
     displayedAqiAvailable = reading.ens160Available;
     logStatus(reading, clockAvailable ? &currentTime : nullptr);
     drawDashboard(reading, clockAvailable ? &currentTime : nullptr,
@@ -1126,7 +1669,12 @@ void loop() {
     publishMqttReadings(reading);
     lastRefreshMillis = refreshStartedAt;
   }
-
+  if (millis() - lastLedUpdateMillis >= LED_UPDATE_INTERVAL_MS) {
+    const SensorReading ledReading = readSensors();
+    latestReading = ledReading;
+    updateAqiPixels(ledReading);
+    lastLedUpdateMillis = millis();
+  }
   const uint32_t currentMillis = millis();
   if (displayedAqiAvailable && displayedAqi >= 4 &&
       currentMillis - lastAqiBlinkMillis >= AQI_BLINK_INTERVAL_MS) {
