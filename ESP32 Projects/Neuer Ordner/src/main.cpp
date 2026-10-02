@@ -5,7 +5,7 @@
 #include <Wire.h>
 #include <time.h>
 
-#include <Adafruit_HDC1000.h>
+#include <Adafruit_SHT31.h>
 #include <DFRobot_ENS160.h>
 #include <GxEPD2_BW.h>
 #include <Adafruit_NeoPixel.h>
@@ -17,8 +17,12 @@
 
 #include "config.h"
 
+#ifndef SHT31_I2C_ADDRESS
+#define SHT31_I2C_ADDRESS 0x44   // SHT31-D: 0x44 (ADR offen) oder 0x45 (ADR auf VIN)
+#endif
+
 DFRobot_ENS160_I2C ens160(&Wire, SENSOR_I2C_ADDRESS);
-Adafruit_HDC1000 hdc1008;
+Adafruit_SHT31 sht31(&Wire);
 Adafruit_NeoPixel aqiPixels(WS2812_LED_COUNT, WS2812_DATA_PIN,
                             NEO_RGB + NEO_KHZ800);
 GxEPD2_BW<GxEPD2_270, GxEPD2_270::HEIGHT> display(
@@ -45,7 +49,7 @@ struct SensorReading {
 };
 
 bool ens160Ready = false;
-bool hdc1008Ready = false;
+bool sht31Ready = false;
 uint32_t lastRefreshMillis = 0;
 uint32_t lastFullRefreshMillis = 0;
 uint8_t displayedAqi = 0;
@@ -328,7 +332,7 @@ bool initializeENS160() {
   return true;
 }
 
-bool initializeHDC1008();
+bool initializeSHT31();
 
 // ENS160 per Opmode 0xF0 zuruecksetzen, dann beide Sensoren neu initialisieren.
 void restartSensors() {
@@ -338,23 +342,28 @@ void restartSensors() {
     delay(10);
   }
   ens160Ready = false;
-  hdc1008Ready = false;
+  sht31Ready = false;
   resetMedian(tvocMedian);
   resetMedian(eco2Median);
   gasValuesInitialized = false;
   if (!simulateSensorData) {
-    hdc1008Ready = initializeHDC1008();
+    sht31Ready = initializeSHT31();
     ens160Ready = initializeENS160();
   }
 }
 
-bool initializeHDC1008() {
-  if (!hdc1008.begin(HDC1008_I2C_ADDRESS, &Wire)) {
-    Serial.println("HDC1008 not found; will retry on the next refresh.");
-    return false;
+bool initializeSHT31() {
+  uint8_t address = SHT31_I2C_ADDRESS;
+  if (!sht31.begin(address)) {
+    address = SHT31_I2C_ADDRESS == 0x45 ? 0x44 : 0x45;
+    if (!sht31.begin(address)) {
+      Serial.println("SHT31 not found at 0x44 or 0x45; check I2C wiring.");
+      return false;
+    }
   }
 
-  Serial.println("HDC1008 ready.");
+  sht31.heater(false);
+  Serial.printf("SHT31 ready at 0x%02X.\n", address);
   return true;
 }
 
@@ -393,13 +402,13 @@ SensorReading readSensors() {
     return reading;
   }
 
-  if (!hdc1008Ready) {
-    hdc1008Ready = initializeHDC1008();
+  if (!sht31Ready) {
+    sht31Ready = initializeSHT31();
   }
 
-  if (hdc1008Ready) {
-    const float temperature = hdc1008.readTemperature();
-    const float humidity = hdc1008.readHumidity();
+  if (sht31Ready) {
+    const float temperature = sht31.readTemperature();
+    const float humidity = sht31.readHumidity();
     if (isfinite(temperature) && isfinite(humidity)) {
       reading.climateAvailable = true;
       reading.temperature = temperature + temperatureOffsetC;
@@ -1113,10 +1122,10 @@ void handleParametersPage() {
             "<input id='tempOffset' name='tempOffset' type='number' min='-10' max='10' step='0.1' value='");
   body += String(temperatureOffsetC, 1);
   body += F("' required><div class='hint'>Wird zur gemessenen Temperatur addiert, z. B. -1.5 bei Eigenerwärmung.</div></div>");
-  body += F("<div class='row'><label for='fallbackTemp'>HDC1008 Fallback Temperatur (C)</label>"
+  body += F("<div class='row'><label for='fallbackTemp'>ENS160 Fallback Temperatur (C)</label>"
             "<input id='fallbackTemp' name='fallbackTemp' type='number' min='-40' max='125' step='0.1' value='");
   body += String(fallbackTemperatureC, 1);
-  body += F("' required></div><div class='row'><label for='fallbackHum'>HDC1008 Fallback Feuchte (%)</label>"
+  body += F("' required></div><div class='row'><label for='fallbackHum'>ENS160 Fallback Feuchte (%)</label>"
             "<input id='fallbackHum' name='fallbackHum' type='number' min='0' max='100' step='0.1' value='");
   body += String(fallbackHumidityPercent, 1);
   body += F("' required></div><div class='subcard'><h3>Median-Filter</h3>"
@@ -1604,7 +1613,7 @@ void setup() {
   if (simulateSensorData) {
     Serial.println("Sensor simulation enabled.");
   } else {
-    hdc1008Ready = initializeHDC1008();
+    sht31Ready = initializeSHT31();
     ens160Ready = initializeENS160();
   }
 
